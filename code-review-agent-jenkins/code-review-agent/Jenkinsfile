@@ -1,0 +1,254 @@
+pipeline {
+    agent any
+
+    environment {
+        OLLAMA_URL     = 'http://localhost:11434'
+        REPORTS_DIR    = 'reports'
+        WATCH_EXTS     = '.py .js .ts .java .cpp .c .go .rb .php'
+        DOCKER_TIMEOUT = '30'
+    }
+
+    triggers {
+        githubPush()
+    }
+
+    stages {
+
+        // -------------------------------------------------------
+        // STAGE 1 — Checkout
+        // Pull the exact commit that triggered this build
+        // -------------------------------------------------------
+        stage('Checkout') {
+            steps {
+                echo "Checking out commit: ${env.GIT_COMMIT}"
+                checkout scm
+                echo "Workspace ready at: ${env.WORKSPACE}"
+            }
+        }
+
+        // -------------------------------------------------------
+        // STAGE 2 — Setup
+        // Install Python dependencies and verify Ollama is running
+        // -------------------------------------------------------
+        stage('Setup') {
+            steps {
+                echo "Installing Python dependencies..."
+                bat 'pip install -r requirements.txt --quiet'
+
+                echo "Checking Ollama is running..."
+                script {
+                    def ollamaCheck = bat(
+                        script: 'curl -s http://localhost:11434/api/tags',
+                        returnStatus: true
+                    )
+                    if (ollamaCheck != 0) {
+                        error("Ollama is not running. Please start it with: ollama serve")
+                    }
+                    echo "Ollama is up and running."
+                }
+            }
+        }
+
+        // -------------------------------------------------------
+        // STAGE 3 — Detect changes
+        // Use git diff to find what files changed in this push
+        // -------------------------------------------------------
+        stage('Detect Changes') {
+            steps {
+                script {
+                    echo "Detecting changed files..."
+
+                    // Get list of changed files between last 2 commits
+                    def changedFiles = bat(
+                        script: 'git diff --name-only HEAD~1 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!changedFiles) {
+                        echo "No files changed. Skipping review."
+                        currentBuild.result = 'SUCCESS'
+                        return
+                    }
+
+                    echo "Changed files:\n${changedFiles}"
+
+                    // Filter to only supported code file types
+                    def supportedExts = env.WATCH_EXTS.split(' ')
+                    def codeFiles = changedFiles.split('\n').findAll { file ->
+                        supportedExts.any { ext -> file.trim().endsWith(ext) }
+                    }
+
+                    if (codeFiles.isEmpty()) {
+                        echo "No supported code files changed. Skipping review."
+                        currentBuild.result = 'SUCCESS'
+                        return
+                    }
+
+                    echo "Code files to review: ${codeFiles}"
+
+                    // Save to env for next stages
+                    env.CHANGED_CODE_FILES = codeFiles.join(',')
+                }
+            }
+        }
+
+        // -------------------------------------------------------
+        // STAGE 4 — AI Review
+        // Send changed files to CodeLlama via Ollama for analysis
+        // -------------------------------------------------------
+        stage('AI Review') {
+            when {
+                expression { env.CHANGED_CODE_FILES != null && env.CHANGED_CODE_FILES != '' }
+            }
+            steps {
+                script {
+                    echo "Running AI code review on: ${env.CHANGED_CODE_FILES}"
+
+                    def reviewResult = bat(
+                        script: "python jenkins_agent.py --files \"${env.CHANGED_CODE_FILES}\" --commit \"${env.GIT_COMMIT}\" --branch \"${env.BRANCH_NAME}\"",
+                        returnStatus: true
+                    )
+
+                    // Exit code 0 = clean review, 1 = critical issues found
+                    if (reviewResult == 1) {
+                        echo "AI review flagged critical issues. Marking build as UNSTABLE."
+                        currentBuild.result = 'UNSTABLE'
+                    } else if (reviewResult == 2) {
+                        error("AI review failed to run. Check Ollama and agent logs.")
+                    } else {
+                        echo "AI review completed. No critical issues found."
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------------
+        // STAGE 5 — Run Code in Docker Sandbox
+        // Safely execute changed files and capture output
+        // -------------------------------------------------------
+        stage('Run Code (Sandbox)') {
+            when {
+                expression { env.CHANGED_CODE_FILES != null && env.CHANGED_CODE_FILES != '' }
+            }
+            steps {
+                script {
+                    def files = env.CHANGED_CODE_FILES.split(',')
+
+                    files.each { filePath ->
+                        filePath = filePath.trim()
+                        def ext = filePath.tokenize('.').last()
+                        def dockerImage = getDockerImage(ext)
+
+                        if (dockerImage == null) {
+                            echo "No Docker image for .${ext} — skipping execution."
+                            return
+                        }
+
+                        echo "Running ${filePath} in Docker (${dockerImage})..."
+
+                        def runResult = bat(
+                            script: """
+                                docker run --rm ^
+                                    --network none ^
+                                    --memory 256m ^
+                                    --cpus 0.5 ^
+                                    -v "%WORKSPACE%:/app" ^
+                                    --workdir /app ^
+                                    ${dockerImage} ^
+                                    timeout ${env.DOCKER_TIMEOUT} python ${filePath} ^
+                                    > reports/execution_output.txt 2>&1
+                            """,
+                            returnStatus: true
+                        )
+
+                        if (runResult != 0) {
+                            echo "Code execution finished with errors. See execution_output.txt in artifacts."
+                        } else {
+                            echo "Code executed successfully."
+                        }
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------------
+        // STAGE 6 — Publish Report
+        // Archive the report as a Jenkins build artifact
+        // -------------------------------------------------------
+        stage('Publish Report') {
+            steps {
+                script {
+                    echo "Archiving review reports..."
+
+                    // Archive all generated reports as build artifacts
+                    archiveArtifacts artifacts: 'reports/*.md', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'reports/*.txt', allowEmptyArchive: true
+
+                    // Print report summary to Jenkins console
+                    def reportFiles = findFiles(glob: 'reports/*.md')
+                    if (reportFiles.length > 0) {
+                        echo "Reports generated:"
+                        reportFiles.each { f -> echo "  - ${f.name}" }
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------
+    // POST — Notify developer of result
+    // -------------------------------------------------------
+    post {
+        success {
+            echo """
+            ============================================
+             BUILD PASSED
+             AI review found no critical issues.
+             Commit: ${env.GIT_COMMIT}
+             Branch: ${env.BRANCH_NAME}
+            ============================================
+            """
+        }
+        unstable {
+            echo """
+            ============================================
+             BUILD UNSTABLE
+             AI review flagged issues in your code.
+             Check the report artifact for full details.
+             Commit: ${env.GIT_COMMIT}
+             Branch: ${env.BRANCH_NAME}
+            ============================================
+            """
+        }
+        failure {
+            echo """
+            ============================================
+             BUILD FAILED
+             Pipeline could not complete.
+             Check console output for the error.
+             Commit: ${env.GIT_COMMIT}
+             Branch: ${env.BRANCH_NAME}
+            ============================================
+            """
+        }
+        always {
+            echo "Pipeline finished. Check the 'Artifacts' tab for the review report."
+        }
+    }
+}
+
+// -------------------------------------------------------
+// Helper — map file extension to Docker image
+// -------------------------------------------------------
+def getDockerImage(String ext) {
+    def imageMap = [
+        'py'   : 'python:3.11-slim',
+        'js'   : 'node:18-slim',
+        'ts'   : 'node:18-slim',
+        'java' : 'openjdk:17-slim',
+        'go'   : 'golang:1.21-alpine',
+        'rb'   : 'ruby:3.2-slim',
+        'php'  : 'php:8.2-cli'
+    ]
+    return imageMap[ext]
+}
