@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────────────────
+# Dockerfile.agent
+# Builds an image with Python 3.11 + pip packages + agent code.
+# Lightweight (~200MB).
+# ─────────────────────────────────────────────────────────
+
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install pip packages first (cached layer — only rebuilds if requirements change)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy agent code
+COPY agent.py .
+COPY jenkins_agent.py .
+
+# Create folders
+RUN mkdir -p watched_code reports
+
+# Default command — run the standalone folder watcher
+CMD ["python3", "agent.py"]

@@ -1,0 +1,30 @@
+# Dockerfile.agent
+# -----------------
+# Builds the AI code review agent container.
+# Contains Python, pip packages, and all agent code.
+# No internet needed on target machine after this is built.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies first
+# (separate layer so it's cached if code changes)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all agent code
+COPY agent.py .
+COPY jenkins_agent.py .
+
+# Create folders
+RUN mkdir -p watched_code reports
+
+# Default command — runs the folder watcher agent
+CMD ["python3", "agent.py"]

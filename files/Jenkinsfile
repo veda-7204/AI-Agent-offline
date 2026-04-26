@@ -1,0 +1,166 @@
+pipeline {
+    agent any
+
+    environment {
+        OLLAMA_URL     = 'http://ollama:11434'
+        REPORTS_DIR    = 'reports'
+        WATCH_EXTS     = '.py .js .ts .java .cpp .c .go .rb .php'
+        DOCKER_TIMEOUT = '30'
+        // Local repo path on the Ubuntu machine — update this to your actual path
+        LOCAL_REPO     = '/home/${env.USER}/code-review-agent'
+    }
+
+    // No GitHub trigger — build is triggered manually via "Build Now"
+    // This works fully offline without any internet connection
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    // Use local repo directly — no internet needed
+                    echo "Using local repo at: ${env.LOCAL_REPO}"
+                    sh "cp -r ${env.LOCAL_REPO}/. ${env.WORKSPACE}/ || true"
+                    echo "Workspace ready."
+                }
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                sh 'pip3 install -r requirements.txt --quiet --break-system-packages || pip3 install -r requirements.txt --quiet'
+                script {
+                    def check = sh(script: 'curl -s http://ollama:11434/api/tags', returnStatus: true)
+                    if (check != 0) {
+                        error("Ollama is not reachable. Make sure docker compose is running.")
+                    }
+                    echo "Ollama is ready."
+                }
+            }
+        }
+
+        stage('Detect Changes') {
+            steps {
+                script {
+                    // Scan workspace for all supported code files
+                    // Works offline — no git diff needed
+                    def supportedExts = env.WATCH_EXTS.split(' ')
+
+                    def codeFiles = []
+                    supportedExts.each { ext ->
+                        def found = sh(
+                            script: "find ${env.WORKSPACE} -name '*${ext}' -not -path '*/reports/*' -not -path '*/__pycache__/*'",
+                            returnStdout: true
+                        ).trim()
+                        if (found) {
+                            found.split('\n').each { f ->
+                                if (f.trim()) codeFiles << f.trim()
+                            }
+                        }
+                    }
+
+                    if (codeFiles.isEmpty()) {
+                        echo "No supported code files found in workspace."
+                        currentBuild.result = 'SUCCESS'
+                        return
+                    }
+
+                    echo "Files found for review:"
+                    codeFiles.each { f -> echo "  - ${f}" }
+                    env.CHANGED_CODE_FILES = codeFiles.join(',')
+                }
+            }
+        }
+
+        stage('AI Review') {
+            when {
+                expression { env.CHANGED_CODE_FILES != null && env.CHANGED_CODE_FILES != '' }
+            }
+            steps {
+                script {
+                    // Use local commit hash if available, otherwise use timestamp
+                    def commitId = sh(
+                        script: "cd ${env.LOCAL_REPO} && git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S",
+                        returnStdout: true
+                    ).trim()
+
+                    def branchName = sh(
+                        script: "cd ${env.LOCAL_REPO} && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'local'",
+                        returnStdout: true
+                    ).trim()
+
+                    def result = sh(
+                        script: "python3 ${env.WORKSPACE}/jenkins_agent.py --files '${env.CHANGED_CODE_FILES}' --commit '${commitId}' --branch '${branchName}'",
+                        returnStatus: true
+                    )
+                    if (result == 1) {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "Critical issues found. Build marked UNSTABLE."
+                    } else if (result == 2) {
+                        error("Agent failed to run.")
+                    } else {
+                        echo "Review complete. No critical issues."
+                    }
+                }
+            }
+        }
+
+        stage('Run Code (Sandbox)') {
+            when {
+                expression { env.CHANGED_CODE_FILES != null && env.CHANGED_CODE_FILES != '' }
+            }
+            steps {
+                script {
+                    def files = env.CHANGED_CODE_FILES.split(',')
+                    files.each { filePath ->
+                        filePath = filePath.trim()
+                        def ext  = filePath.tokenize('.').last()
+                        def img  = getDockerImage(ext)
+                        if (img == null) { echo "Skipping .${ext} — no runner."; return }
+
+                        sh """
+                            mkdir -p reports
+                            docker run --rm \
+                                --network none \
+                                --memory 256m \
+                                --cpus 0.5 \
+                                -v "\${WORKSPACE}:/app" \
+                                --workdir /app \
+                                ${img} \
+                                timeout ${env.DOCKER_TIMEOUT} python3 ${filePath} \
+                                > reports/execution_output.txt 2>&1 || true
+                        """
+                        echo "Execution done. Output in reports/execution_output.txt"
+                    }
+                }
+            }
+        }
+
+        stage('Publish Report') {
+            steps {
+                sh 'mkdir -p reports'
+                archiveArtifacts artifacts: 'reports/*.md', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'reports/*.txt', allowEmptyArchive: true
+                echo "Reports archived. Check the Artifacts tab."
+            }
+        }
+    }
+
+    post {
+        success  { echo "BUILD PASSED — No critical issues found." }
+        unstable { echo "BUILD UNSTABLE — Critical issues detected. Check Artifacts for report." }
+        failure  { echo "BUILD FAILED — Check console output for errors." }
+    }
+}
+
+def getDockerImage(String ext) {
+    return [
+        'py'  : 'python:3.11-slim',
+        'js'  : 'node:18-slim',
+        'ts'  : 'node:18-slim',
+        'java': 'openjdk:17-slim',
+        'go'  : 'golang:1.21-alpine',
+        'rb'  : 'ruby:3.2-slim',
+        'php' : 'php:8.2-cli'
+    ][ext]
+}

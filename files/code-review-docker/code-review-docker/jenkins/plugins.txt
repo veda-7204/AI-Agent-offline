@@ -1,0 +1,8 @@
+github
+github-branch-source
+workflow-aggregator
+git
+pipeline-stage-view
+credentials
+ssh-credentials
+plain-credentials

@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────
+# Dockerfile.ollama
+# Builds an image with Ollama + CodeLlama model baked in.
+# Build this once on your Windows laptop.
+# The model (~4GB) is downloaded during the build.
+# ─────────────────────────────────────────────────────────
+
+FROM ollama/ollama:latest
+
+# Copy the model pull script
+COPY pull_model.sh /pull_model.sh
+RUN chmod +x /pull_model.sh
+
+# Start Ollama in background, pull CodeLlama, then stop
+# This bakes the model into the image so no internet is needed later
+RUN /pull_model.sh
+
+# Expose Ollama API port
+EXPOSE 11434
+
+# Start Ollama server when container runs
+CMD ["ollama", "serve"]

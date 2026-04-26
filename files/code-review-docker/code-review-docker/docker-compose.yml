@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+
+  # -----------------------------------------------
+  # Ollama — runs Mistral AI model locally
+  # -----------------------------------------------
+  ollama:
+    image: code-review-ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # -----------------------------------------------
+  # Agent — folder watcher (standalone mode)
+  # Watches watched_code/ and reviews files dropped in
+  # -----------------------------------------------
+  agent:
+    image: code-review-agent:latest
+    container_name: agent
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    volumes:
+      - ./watched_code:/app/watched_code    # drop files here
+      - ./reports:/app/reports              # reports saved here
+    command: python3 agent.py
+
+  # -----------------------------------------------
+  # Jenkins — CI/CD pipeline
+  # Triggers agent automatically on every git push
+  # -----------------------------------------------
+  jenkins:
+    image: code-review-jenkins:latest
+    container_name: jenkins
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    volumes:
+      - jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock  # lets Jenkins run Docker
+      - ./reports:/reports                          # shared reports folder
+    user: root  # needed to access docker socket
+
+volumes:
+  ollama_data:
+  jenkins_data:

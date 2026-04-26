@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────
+# Dockerfile.jenkins
+# Builds a Jenkins image with:
+#   - Java 17 (baked in)
+#   - Jenkins LTS
+#   - GitHub Integration Plugin pre-installed
+#   - Python 3 + pip available inside Jenkins
+#   - Docker CLI available inside Jenkins
+# ─────────────────────────────────────────────────────────
+
+FROM jenkins/jenkins:lts-jdk17
+
+# Switch to root to install extra tools
+USER root
+
+# Install Python 3, pip, curl, and Docker CLI
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    curl \
+    docker.io \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages needed by the agent
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# Pre-install Jenkins plugins so no internet needed on the office PC
+# github-plugin lets Jenkins receive GitHub webhooks
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
+
+# Switch back to jenkins user
+USER jenkins
+
+# Jenkins runs on port 8080
+EXPOSE 8080
+
+# Jenkins agent port
+EXPOSE 50000
